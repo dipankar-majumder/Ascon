@@ -1,128 +1,143 @@
+// main.cpp
 #include <iostream>
 #include <vector>
 #include <random>
+#include <array>
+#include <algorithm>
+#include <iomanip>
 #include <cassert>
-#include <algorithm> // for std::copy
-#include <array>     // for std::array
-#include <iomanip>   // for std::hex, setw, setfill
 #include "Ascon128.hpp"
 
-// flip a single bit in an 8-byte block (bit 0 = MSB of byte[0], bit 63 = LSB of byte[7])
-static void flip_bit(std::vector<uint8_t>& block, int bit) {
-    int byte = bit / 8;
-    int off  = 7 - (bit % 8);
-    block[byte] ^= uint8_t(1u << off);
+// flip one bit in an 8-byte block (bit 0 = MSB of byte[0], bit 63 = LSB of byte[7])
+static void flip_bit(std::vector<uint8_t> &blk, int bit)
+{
+  int byte = bit / 8;
+  int off = 7 - (bit % 8);
+  blk[byte] ^= uint8_t(1u << off);
 }
 
-int main() {
-    // 0) RNG
-    std::mt19937_64 rng{ std::random_device{}() };
-    auto rnd_byte = [&]{ return uint8_t(rng() & 0xFF); };
+// hex dump
+static void print_hex(const std::vector<uint8_t> &v)
+{
+  std::cout << std::hex << std::setfill('0');
+  for (auto b : v)
+    std::cout << std::setw(2) << int(b);
+  std::cout << std::dec << "\n";
+}
 
-    // 1) Random key & nonce
+int main()
+{
+  // 1) AEAD self-test
+  {
+    std::cout << "--- AEAD self-test ---\n";
+    std::mt19937_64 rng{std::random_device{}()};
+    auto rnd = [&]
+    { return uint8_t(rng() & 0xFF); };
+
     std::vector<uint8_t> key(ASCON_KEY_SIZE), nonce(ASCON_NONCE_SIZE);
-    for (auto &b : key)   b = rnd_byte();
-    for (auto &b : nonce) b = rnd_byte();
+    for (auto &b : key)
+      b = rnd();
+    for (auto &b : nonce)
+      b = rnd();
 
-    // 2) Three random 8-byte plaintexts
-    std::vector<std::vector<uint8_t>> P(3, std::vector<uint8_t>(8));
-    for (auto &blk : P)
-        for (auto &b : blk)
-            b = rnd_byte();
+    std::string msg = "Hello, ASCON-128 AEAD!";
+    std::vector<uint8_t> pt(msg.begin(), msg.end()), ad;
 
-    // 3) Collect fault-free tags
     Ascon128 ascon;
-    ascon.fault_enabled = false;
+    auto ct = ascon.encrypt(key, nonce, ad, pt);
+    auto rec = ascon.decrypt(key, nonce, ad, ct);
 
-    // T[k][i] holds the 16-byte tag for the k-th base plaintext with its i-th bit flipped
-    std::vector<std::vector<std::array<uint8_t, ASCON_TAG_SIZE>>> T(
-      3, std::vector<std::array<uint8_t, ASCON_TAG_SIZE>>(64)
-    );
+    std::cout << "Plaintext:  " << msg << "\n";
+    std::cout << "Ciphertext: ";
+    print_hex(ct);
+    assert(rec == pt && "AEAD self-test failed");
+    std::cout << "Decryption OK\n\n";
+  }
 
-    for (int k = 0; k < 3; k++) {
-        for (int i = 0; i < 64; i++) {
-            auto Q = P[k];
-            flip_bit(Q, i);
-            auto C = ascon.encrypt(key, nonce, {}, Q);
-            assert(C.size() >= ASCON_TAG_SIZE);
-            // copy last 16 bytes → tag
-            std::copy(C.end() - ASCON_TAG_SIZE, C.end(), T[k][i].begin());
-        }
-    }
+  // 2) POC PFA for j corresponding to lane F
+  std::mt19937_64 rng{std::random_device{}()};
+  auto rnd = [&]
+  { return uint8_t(rng() & 0xFF); };
 
-    // 4) Enable the persistent fault
-    ascon.fault_enabled = true;
-    ascon.fault_index   = 0x01;  // corrupt S-box input = 1
-    ascon.fault_mask    = 0x03;  // flip its low 2 bits
+  // random key & nonce
+  std::vector<uint8_t> key(ASCON_KEY_SIZE), nonce(ASCON_NONCE_SIZE);
+  for (auto &b : key)
+    b = rnd();
+  for (auto &b : nonce)
+    b = rnd();
 
-    // 5) Collect faulty tags
-    auto Tprime = T;  // same dimensions
-    for (int k = 0; k < 3; k++) {
-        for (int i = 0; i < 64; i++) {
-            auto Q = P[k];
-            flip_bit(Q, i);
-            auto C = ascon.encrypt(key, nonce, {}, Q);
-            assert(C.size() >= ASCON_TAG_SIZE);
-            std::copy(C.end() - ASCON_TAG_SIZE, C.end(), Tprime[k][i].begin());
-        }
-    }
+  // three random 8-byte base plaintexts
+  std::vector<std::vector<uint8_t>> P(3, std::vector<uint8_t>(8));
+  for (auto &blk : P)
+    for (auto &b : blk)
+      b = rnd();
 
-    // 6) Strong-adversary key recovery (Algorithm 1)
-    std::array<int,   64>   j0, j1;
-    std::array<uint8_t,64> K0_bits{}, K1_bits{};
+  // collect fault-free tags T0[i] for k=0
+  Ascon128 ascon;
+  ascon.fault_enabled = false;
 
-    for (int bit = 0; bit < 64; bit++) {
-        bool found0 = false, found1 = false;
+  std::array<std::array<uint8_t, ASCON_TAG_SIZE>, 64> T0;
+  for (int i = 0; i < 64; i++)
+  {
+    auto Q = P[0];
+    flip_bit(Q, i);
+    auto C = ascon.encrypt(key, nonce, {}, Q);
+    std::copy_n(C.end() - ASCON_TAG_SIZE,
+                ASCON_TAG_SIZE,
+                T0[i].begin());
+  }
 
-        for (int i = 0; i < 64; i++) {
-            // extract the bit 'bit' of tag T[0][i]
-            uint8_t b0  = (T[0][i][bit/8]  >> (7 - (bit%8))) & 1;
-            uint8_t b0p = (Tprime[0][i][bit/8] >> (7 - (bit%8))) & 1;
-            if (!found0 && b0 != b0p) {
-                j0[bit]     = i;
-                K0_bits[bit] = b0;   // strong adversary knows the S-box differential
-                found0 = true;
-            }
+  // pick a random lane F to fault
+  std::uniform_int_distribution<int> dist(0, 63);
+  int F = dist(rng);
+  std::cout << "--- POC PFA (bit j = 63 - F) ---\n";
+  std::cout << "Injecting persistent fault at lane = " << F << "\n";
 
-            uint8_t b1  = (T[1][i][bit/8]  >> (7 - (bit%8))) & 1;
-            uint8_t b1p = (Tprime[1][i][bit/8] >> (7 - (bit%8))) & 1;
-            if (!found1 && b1 != b1p) {
-                j1[bit]     = i;
-                K1_bits[bit] = b1;
-                found1 = true;
-            }
+  ascon.fault_enabled = true;
+  ascon.fault_lane = F;
+  ascon.fault_mask = 0x03; // flip low 2 bits
 
-            if (found0 && found1) break;
-        }
-        assert(found0 && found1);
-    }
+  // collect faulty tags T0p[i]
+  std::array<std::array<uint8_t, ASCON_TAG_SIZE>, 64> T0p;
+  for (int i = 0; i < 64; i++)
+  {
+    auto Q = P[0];
+    flip_bit(Q, i);
+    auto C = ascon.encrypt(key, nonce, {}, Q);
+    std::copy_n(C.end() - ASCON_TAG_SIZE,
+                ASCON_TAG_SIZE,
+                T0p[i].begin());
+  }
 
-    // 7) Reconstruct 128-bit key from bit arrays
-    std::vector<uint8_t> Krec(16, 0);
-    for (int b = 0; b < 64; b++) {
-        if (K0_bits[b]) {
-            int byte = b/8, off = 7 - (b%8);
-            Krec[byte] |= uint8_t(1u << off);
-        }
-        if (K1_bits[b]) {
-            int byte = 8 + (b/8), off = 7 - (b%8);
-            Krec[byte] |= uint8_t(1u << off);
-        }
-    }
+  // compute the tag-bit index j = 63 - lane (for x3 half)
+  int j = 63 - F;
+  std::cout << "Inspecting tag-bit j=" << j << " differences:\n";
 
-    // 8) Print comparison
-    auto print_hex = [&](const std::vector<uint8_t>& v) {
-        std::cout << std::hex << std::setfill('0');
-        for (auto x : v) {
-            std::cout << std::setw(2) << int(x);
-        }
-        std::cout << std::dec;
-    };
+  int hit_i = -1;
+  for (int i = 0; i < 64; i++)
+  {
+    // bit j lives in byte index (j/8), bit position (7 - j%8)
+    int bidx = j / 8, boff = 7 - (j % 8);
+    uint8_t bf = (T0[i][bidx] >> boff) & 1;
+    uint8_t bp = (T0p[i][bidx] >> boff) & 1;
+    std::cout << " i=" << std::setw(2) << i
+              << "  fault-free=" << int(bf)
+              << "  faulty=" << int(bp)
+              << (bf != bp ? "   <-- flipped\n" : "\n");
+    if (bf != bp)
+      hit_i = i;
+  }
 
-    std::cout << "=== CP-PFA Results ===\n";
-    std::cout << "True key : ";  print_hex(key);   std::cout << "\n";
-    std::cout << "Recov key: ";  print_hex(Krec);  std::cout << "\n";
-    std::cout << (key == Krec ? "SUCCESS\n" : "FAIL\n");
+  if (hit_i >= 0)
+  {
+    std::cout << "\nSuccess: only i=" << hit_i
+              << " flipped tag-bit j=" << j
+              << " for lane=" << F << "\n";
+  }
+  else
+  {
+    std::cout << "\nFailure: no flip detected on bit j=" << j << "\n";
+  }
 
-    return 0;
+  return 0;
 }

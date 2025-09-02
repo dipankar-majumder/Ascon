@@ -4,21 +4,18 @@
 #include <cstdint>
 #include <vector>
 
-// ASCON-128 parameters
-static constexpr size_t ASCON_KEY_SIZE = 16;   // 128 bits
-static constexpr size_t ASCON_NONCE_SIZE = 16; // 128 bits
-static constexpr size_t ASCON_TAG_SIZE = 16;   // 128 bits
-static constexpr size_t ASCON_RATE = 8;        // 64 bits
+static constexpr size_t ASCON_KEY_SIZE = 16;   // bytes
+static constexpr size_t ASCON_NONCE_SIZE = 16; // bytes
+static constexpr size_t ASCON_TAG_SIZE = 16;   // bytes
+static constexpr size_t ASCON_RATE = 8;        // bytes
 
 class Ascon128
 {
 public:
-    // Fault‐injection controls (strong adversary model)
-    bool fault_enabled = false; // turn ON/OFF the persistent fault
-    uint8_t fault_index = 0x01; // which 5-bit S-box input we corrupt
-    uint8_t fault_mask = 0x03;  // XOR this into the S-box output
-
-    // Constructor / destructor auto-defined
+    // Fault‐injection controls (strong adversary = pick one bit-slice)
+    bool fault_enabled = false;
+    int fault_lane = 0;        // which bit‐slice [0..63] to corrupt
+    uint8_t fault_mask = 0x03; // XOR into S-box output (flip low 2 bits)
 
     // AEAD interface
     std::vector<uint8_t> encrypt(
@@ -34,21 +31,14 @@ public:
         const std::vector<uint8_t> &ciphertext);
 
 private:
-    // 320-bit state as five 64-bit words
-    uint64_t state[5];
+    uint64_t state[5]; // 320‐bit state (5×64)
+    bool in_finalization = false;
 
-    // Core permutation: runs the *last* nr rounds of the 12-round ASCON perm
     void permutation(int nr);
-
-    // Absorb-only (for associated data), always calls p_b on *every* block
     void absorb(const std::vector<uint8_t> &data);
-
-    // Absorb-and-encrypt (for plaintext)
     void absorb_and_encrypt(
         std::vector<uint8_t> &ciphertext,
         const std::vector<uint8_t> &plaintext);
-
-    // Absorb-and-decrypt (for ciphertext)
     void absorb_and_decrypt(
         std::vector<uint8_t> &plaintext,
         const std::vector<uint8_t> &ciphertext);

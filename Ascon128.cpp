@@ -1,10 +1,9 @@
 #include "Ascon128.hpp"
 #include <stdexcept>
+#include <algorithm>
 #include <cstring>
 
-//------------------------------------------------------------------------------
-// big-endian load/store (portable)
-//------------------------------------------------------------------------------
+// portable big-endian 64-bit load/store
 static inline uint64_t load64_be(const uint8_t b[8])
 {
     uint64_t x = 0;
@@ -21,9 +20,7 @@ static inline void store64_be(uint8_t out[8], uint64_t x)
     }
 }
 
-//------------------------------------------------------------------------------
-// Bitwise rotations & diffusion macro
-//------------------------------------------------------------------------------
+// rotate‐right and diffusion macro
 #define ROR(x, n) (((x) >> (n)) | ((x) << (64 - (n))))
 #define ROTATE_WORDS                                       \
     {                                                      \
@@ -34,113 +31,80 @@ static inline void store64_be(uint8_t out[8], uint64_t x)
         state[4] ^= ROR(state[4], 7) ^ ROR(state[4], 41);  \
     }
 
-//------------------------------------------------------------------------------
-// Round constants (only the last 12 rounds matter)
-//------------------------------------------------------------------------------
+// round constants for the last 12 rounds
 static const uint64_t RC[12] = {
-    0x00000000000000F0ULL, 0x00000000000000E1ULL,
-    0x00000000000000D2ULL, 0x00000000000000C3ULL,
-    0x00000000000000B4ULL, 0x00000000000000A5ULL,
-    0x0000000000000096ULL, 0x0000000000000087ULL,
-    0x0000000000000078ULL, 0x0000000000000069ULL,
-    0x000000000000005AULL, 0x000000000000004BULL};
+    0xF0, 0xE1, 0xD2, 0xC3, 0xB4, 0xA5,
+    0x96, 0x87, 0x78, 0x69, 0x5A, 0x4B};
 
-//------------------------------------------------------------------------------
-// Core ASCON permutation: run the last `nr` rounds of the 12-round perm
-//------------------------------------------------------------------------------
+// 5→5 S-box (Table 2)
+static const uint8_t Sbox[32] = {
+    0x04, 0x0B, 0x1F, 0x14, 0x1A, 0x15, 0x09, 0x02,
+    0x16, 0x05, 0x08, 0x12, 0x1D, 0x03, 0x06, 0x1C,
+    0x1E, 0x13, 0x07, 0x0E, 0x00, 0x0D, 0x11, 0x18,
+    0x10, 0x0C, 0x01, 0x19, 0x17, 0x0A, 0x0F, 0x17};
+
+// permutation: run rounds [12-nr .. 11]
 void Ascon128::permutation(int nr)
 {
-    int start = 12 - nr;
-    for (int r = start; r < 12; r++)
+    for (int r = 12 - nr; r < 12; r++)
     {
-        // 1) Add constant to x2
+        // 1) add constant to x2
         state[2] ^= RC[r];
 
-        // 2) 5-word bit‐sliced S‐box
-        //    a) x0 ^= x4; x4 ^= x3; x2 ^= x1
-        state[0] ^= state[4];
-        state[4] ^= state[3];
-        state[2] ^= state[1];
-
-        //    b) nonlinear layer
-        uint64_t t0 = state[0], t1 = state[1],
-                 t2 = state[2], t3 = state[3],
-                 t4 = state[4];
-        state[0] = t0 ^ (~t1 & t2);
-        state[1] = t1 ^ (~t2 & t3);
-        state[2] = t2 ^ (~t3 & t4);
-        state[3] = t3 ^ (~t4 & t0);
-        state[4] = t4 ^ (~t0 & t1);
-
-        //    c) bit-permutation & inversion
-        state[1] ^= state[0];
-        state[0] ^= state[4];
-        state[3] ^= state[2];
-        state[2] = ~state[2];
-
-        // 3) Linear diffusion
-        ROTATE_WORDS
-
-        // ——— Fault injection in the *final* round’s S-box? ———
-        // Actually we want to flip the S-box output *just before* it
-        // is re-written into state[?].  Because we did a bit-sliced
-        // implementation above, we cannot fault‐inject here.  Instead,
-        // what we do is re-execute the S-box on one word, flip its
-        // low-order two bits, and then overwrite one lane of `state`.
-        //
-        // For our strong adversary model (exactly one S-box input index
-        // is corrupted, persistently):
-        if (r == 11 && fault_enabled)
+        // 2) substitution via 64-lane table
         {
-            // We choose word-0’s lane as an example and flip the
-            // word-0 S-box input == fault_index
-            // (in practice you’d bit-slice your fault across all 64 lanes,
-            //  here we just demonstrate the idea on a single lane)
+            uint64_t x0 = state[0], x1 = state[1], x2 = state[2],
+                     x3 = state[3], x4 = state[4];
+            uint64_t y0 = 0, y1 = 0, y2 = 0, y3 = 0, y4 = 0;
+
+            for (int lane = 0; lane < 64; lane++)
             {
-                uint8_t in = uint8_t(state[0] & 0x1FUL); // pick 5-bit
-                if (in == fault_index)
+                uint8_t in = uint8_t(
+                    ((x0 >> lane) & 1ULL) << 4 | ((x1 >> lane) & 1ULL) << 3 | ((x2 >> lane) & 1ULL) << 2 | ((x3 >> lane) & 1ULL) << 1 | ((x4 >> lane) & 1ULL));
+                uint8_t out = Sbox[in];
+
+                // if this is the finalization perm and the chosen lane
+                if (in_finalization && r == 11 && fault_enabled && lane == fault_lane)
                 {
-                    uint8_t out = uint8_t(state[0] >> 5) & 0x1F; // pretend this was the S-box output
-                    out ^= fault_mask;                           // flip its two low bits
-                    // now mash it back
-                    state[0] &= ~0x3FULL; // clear the old 6 bits
-                    state[0] |= (uint64_t(out & 0x1F) << 5);
+                    out ^= fault_mask;
                 }
+
+                y0 |= (uint64_t)((out >> 4) & 1) << lane;
+                y1 |= (uint64_t)((out >> 3) & 1) << lane;
+                y2 |= (uint64_t)((out >> 2) & 1) << lane;
+                y3 |= (uint64_t)((out >> 1) & 1) << lane;
+                y4 |= (uint64_t)((out) & 1) << lane;
             }
+
+            state[0] = y0;
+            state[1] = y1;
+            state[2] = y2;
+            state[3] = y3;
+            state[4] = y4;
         }
+
+        // 3) linear diffusion
+        ROTATE_WORDS;
     }
 }
 
-//------------------------------------------------------------------------------
-// ABSORB-only (for associated data): always call p_b after each block
-//------------------------------------------------------------------------------
-void Ascon128::absorb(const std::vector<uint8_t> &A)
+// absorb-only for associated data (always p_b after every chunk)
+void Ascon128::absorb(const std::vector<uint8_t> &data)
 {
-    size_t i = 0, n = A.size();
+    size_t i = 0, n = data.size();
     while (i < n)
     {
         size_t chunk = std::min(n - i, ASCON_RATE);
-
-        // XOR chunk into x0
         for (size_t j = 0; j < chunk; j++)
-        {
-            state[0] ^= uint64_t(A[i + j]) << (56 - 8 * j);
-        }
-
-        // pad if short
+            state[0] ^= uint64_t(data[i + j]) << (56 - 8 * j);
         if (chunk < ASCON_RATE)
-        {
             state[0] ^= 0x80ULL >> (8 * chunk);
-        }
-
-        permutation(6); // ALWAYS in AAD phase
+        permutation(6);
         i += chunk;
     }
 }
 
-//------------------------------------------------------------------------------
-// ABSORB+ENCRYPT (for plaintext): permute only on *full* blocks
-//------------------------------------------------------------------------------
+// absorb+encrypt for plaintext
 void Ascon128::absorb_and_encrypt(
     std::vector<uint8_t> &C,
     const std::vector<uint8_t> &P)
@@ -149,32 +113,24 @@ void Ascon128::absorb_and_encrypt(
     while (i < n)
     {
         size_t chunk = std::min(n - i, ASCON_RATE);
-
         for (size_t j = 0; j < chunk; j++)
         {
-            // XOR P into state, then output C = high-byte of state
             state[0] ^= uint64_t(P[i + j]) << (56 - 8 * j);
-            uint8_t c = uint8_t(state[0] >> (56 - 8 * j));
-            C.push_back(c);
+            C.push_back(uint8_t(state[0] >> (56 - 8 * j)));
         }
-
         if (chunk == ASCON_RATE)
         {
             permutation(6);
         }
         else
         {
-            // final partial
             state[0] ^= 0x80ULL >> (8 * chunk);
         }
-
         i += chunk;
     }
 }
 
-//------------------------------------------------------------------------------
-// ABSORB+DECRYPT (for ciphertext): invert the above
-//------------------------------------------------------------------------------
+// absorb+decrypt for ciphertext
 void Ascon128::absorb_and_decrypt(
     std::vector<uint8_t> &P,
     const std::vector<uint8_t> &C)
@@ -183,18 +139,14 @@ void Ascon128::absorb_and_decrypt(
     while (i < n)
     {
         size_t chunk = std::min(n - i, ASCON_RATE);
-
         for (size_t j = 0; j < chunk; j++)
         {
             uint8_t s = uint8_t(state[0] >> (56 - 8 * j));
             uint8_t c = C[i + j];
             P.push_back(s ^ c);
-
-            // overwrite state with c
             state[0] &= ~(0xFFULL << (56 - 8 * j));
             state[0] |= uint64_t(c) << (56 - 8 * j);
         }
-
         if (chunk == ASCON_RATE)
         {
             permutation(6);
@@ -203,26 +155,22 @@ void Ascon128::absorb_and_decrypt(
         {
             state[0] ^= 0x80ULL >> (8 * chunk);
         }
-
         i += chunk;
     }
 }
 
-//------------------------------------------------------------------------------
-// ENCRYPT
-//------------------------------------------------------------------------------
+// AEAD Encrypt
 std::vector<uint8_t> Ascon128::encrypt(
     const std::vector<uint8_t> &key,
     const std::vector<uint8_t> &nonce,
     const std::vector<uint8_t> &ad,
     const std::vector<uint8_t> &pt)
 {
-    if (key.size() != ASCON_KEY_SIZE ||
-        nonce.size() != ASCON_NONCE_SIZE)
-        throw std::invalid_argument("bad key/nonce size");
+    if (key.size() != ASCON_KEY_SIZE || nonce.size() != ASCON_NONCE_SIZE)
+        throw std::invalid_argument("encrypt: bad key/nonce");
 
-    // 1) Initialization
-    const uint8_t iv[8] = {0x80, 0x40, 0x0c, 0x06, 0, 0, 0, 0};
+    // 1) initialize
+    const uint8_t iv[8] = {0x80, 0x40, 0x0C, 0x06, 0, 0, 0, 0};
     state[0] = load64_be(iv);
     state[1] = load64_be(&key[0]);
     state[2] = load64_be(&key[8]);
@@ -230,27 +178,28 @@ std::vector<uint8_t> Ascon128::encrypt(
     state[4] = load64_be(&nonce[8]);
     permutation(12);
 
-    // XOR key into x3,x4
+    // xor key
     state[3] ^= state[1];
     state[4] ^= state[2];
 
-    // 2) AAD
+    // 2) associated data
     if (!ad.empty())
         absorb(ad);
-    // domain separation
-    state[4] ^= 1;
+    state[4] ^= 1; // domain separation
 
-    // 3) Encrypt
+    // 3) encrypt
     std::vector<uint8_t> C;
     C.reserve(pt.size() + ASCON_TAG_SIZE);
     absorb_and_encrypt(C, pt);
 
-    // 4) Finalization
+    // 4) finalization
+    in_finalization = true;
     permutation(12);
+    in_finalization = false;
     state[3] ^= state[1];
     state[4] ^= state[2];
 
-    // 5) Tag = x3||x4
+    // 5) append tag = x3||x4
     uint8_t T[16];
     store64_be(T + 0, state[3]);
     store64_be(T + 8, state[4]);
@@ -259,27 +208,23 @@ std::vector<uint8_t> Ascon128::encrypt(
     return C;
 }
 
-//------------------------------------------------------------------------------
-// DECRYPT
-//------------------------------------------------------------------------------
+// AEAD Decrypt + verify
 std::vector<uint8_t> Ascon128::decrypt(
     const std::vector<uint8_t> &key,
     const std::vector<uint8_t> &nonce,
     const std::vector<uint8_t> &ad,
     const std::vector<uint8_t> &ct)
 {
-    if (key.size() != ASCON_KEY_SIZE ||
-        nonce.size() != ASCON_NONCE_SIZE ||
-        ct.size() < ASCON_TAG_SIZE)
-        throw std::invalid_argument("bad sizes");
+    if (key.size() != ASCON_KEY_SIZE || nonce.size() != ASCON_NONCE_SIZE || ct.size() < ASCON_TAG_SIZE)
+        throw std::invalid_argument("decrypt: bad sizes");
 
     // split C||T
     size_t clen = ct.size() - ASCON_TAG_SIZE;
     std::vector<uint8_t> C(ct.begin(), ct.begin() + clen);
     const uint8_t *Trecv = &ct[clen];
 
-    // 1) Initialization (same as encrypt)
-    const uint8_t iv[8] = {0x80, 0x40, 0x0c, 0x06, 0, 0, 0, 0};
+    // 1) init
+    const uint8_t iv[8] = {0x80, 0x40, 0x0C, 0x06, 0, 0, 0, 0};
     state[0] = load64_be(iv);
     state[1] = load64_be(&key[0]);
     state[2] = load64_be(&key[8]);
@@ -289,18 +234,20 @@ std::vector<uint8_t> Ascon128::decrypt(
     state[3] ^= state[1];
     state[4] ^= state[2];
 
-    // 2) AAD
+    // 2) associated data
     if (!ad.empty())
         absorb(ad);
     state[4] ^= 1;
 
-    // 3) Decrypt
+    // 3) decrypt
     std::vector<uint8_t> P;
     P.reserve(C.size());
     absorb_and_decrypt(P, C);
 
-    // 4) Finalization & tag check
+    // 4) finalization + tag check
+    in_finalization = true;
     permutation(12);
+    in_finalization = false;
     state[3] ^= state[1];
     state[4] ^= state[2];
 
@@ -311,9 +258,9 @@ std::vector<uint8_t> Ascon128::decrypt(
     // constant-time compare
     uint8_t diff = 0;
     for (int i = 0; i < 16; i++)
-        diff |= (Tcalc[i] ^ Trecv[i]);
+        diff |= Tcalc[i] ^ Trecv[i];
     if (diff)
-        return {}; // tag failure
+        return {}; // tag mismatch
 
     return P;
 }
